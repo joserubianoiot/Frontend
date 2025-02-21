@@ -311,8 +311,9 @@ export class HuiHistoryGraphCard extends LitElement implements LovelaceCard {
       color: var(--primary-text-color);
     }
     .content {
-      padding: 0 16px 8px 16px;
+      padding: 0 16px 8px;
       flex: 1;
+      overflow: hidden;
     }
     .has-header {
       padding-top: 0;

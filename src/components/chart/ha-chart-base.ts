@@ -1,11 +1,12 @@
 import { consume } from "@lit-labs/context";
 import { ResizeController } from "@lit-labs/observers/resize-controller";
-import { mdiRestart } from "@mdi/js";
+import { mdiChevronDown, mdiChevronUp, mdiRestart } from "@mdi/js";
 import { differenceInMinutes } from "date-fns";
 import type { DataZoomComponentOption } from "echarts/components";
 import type { EChartsType } from "echarts/core";
 import type {
   ECElementEvent,
+  LegendComponentOption,
   XAXisOption,
   YAXisOption,
 } from "echarts/types/dist/shared";
@@ -25,6 +26,7 @@ import { isMac } from "../../util/is_mac";
 import "../ha-icon-button";
 import { formatTimeLabel } from "./axis-label";
 import { ensureArray } from "../../common/array/ensure-array";
+import "../ha-ripple";
 
 export const MIN_TIME_BETWEEN_UPDATES = 60 * 5 * 1000;
 
@@ -40,9 +42,6 @@ export class HaChartBase extends LitElement {
 
   @property({ type: String }) public height?: string;
 
-  @property({ attribute: "external-hidden", type: Boolean })
-  public externalHidden = false;
-
   @state()
   @consume({ context: themesContext, subscribe: true })
   _themes!: Themes;
@@ -52,6 +51,10 @@ export class HaChartBase extends LitElement {
   @state() private _zoomRatio = 1;
 
   @state() private _minutesDifference = 24 * 60;
+
+  @state() private _hiddenDatasets = new Set<string>();
+
+  @state() private _expandedLegend = false;
 
   private _modifierPressed = false;
 
@@ -135,8 +138,8 @@ export class HaChartBase extends LitElement {
       return;
     }
     let chartOptions: ECOption = {};
-    if (changedProps.has("data")) {
-      chartOptions.series = this.data;
+    if (changedProps.has("data") || changedProps.has("_hiddenDatasets")) {
+      chartOptions.series = this._getSeries();
     }
     if (changedProps.has("options")) {
       chartOptions = { ...chartOptions, ...this._createOptions() };
@@ -151,15 +154,20 @@ export class HaChartBase extends LitElement {
   protected render() {
     return html`
       <div
-        class=${classMap({
-          "chart-container": true,
-          "has-legend": !!this.options?.legend,
-        })}
+        class="container ${classMap({ "has-height": !!this.height })}"
         style=${styleMap({
-          height: this.height ?? `${this._getDefaultHeight()}px`,
+          height: this.height,
         })}
       >
-        <div class="chart"></div>
+        <div
+          class="chart-container"
+          style=${styleMap({
+            height: this.height ? undefined : `${this._getDefaultHeight()}px`,
+          })}
+        >
+          <div class="chart"></div>
+        </div>
+        ${this._renderLegend()}
         ${this._isZoomed
           ? html`<ha-icon-button
               class="zoom-reset"
@@ -172,6 +180,74 @@ export class HaChartBase extends LitElement {
           : nothing}
       </div>
     `;
+  }
+
+  private _renderLegend() {
+    if (!this.options?.legend || !this.data) {
+      return nothing;
+    }
+    const legend = ensureArray(this.options.legend)[0] as LegendComponentOption;
+    if (!legend.show) {
+      return nothing;
+    }
+    const datasets = ensureArray(this.data);
+    const items = (legend.data ||
+      datasets
+        .filter((d) => (d.data as any[])?.length && (d.id || d.name))
+        .map((d) => d.name ?? d.id) ||
+      []) as string[];
+
+    const isMobile = window.matchMedia(
+      "all and (max-width: 450px), all and (max-height: 500px)"
+    ).matches;
+    const overflowLimit = isMobile ? 6 : 10;
+    return html`<div class="chart-legend">
+      <ul>
+        ${items.map((item: string, index: number) => {
+          if (!this._expandedLegend && index >= overflowLimit) {
+            return nothing;
+          }
+          const dataset = datasets.find(
+            (d) => d.id === item || d.name === item
+          );
+          const color = dataset?.color as string;
+          const borderColor = dataset?.itemStyle?.borderColor as string;
+          return html`<li
+            .name=${item}
+            @click=${this._legendClick}
+            class=${classMap({ hidden: this._hiddenDatasets.has(item) })}
+            .title=${item}
+          >
+            <div
+              class="bullet"
+              style=${styleMap({
+                backgroundColor: color,
+                borderColor: borderColor || color,
+              })}
+            ></div>
+            <div class="label">${item}</div>
+          </li>`;
+        })}
+        ${items.length > overflowLimit
+          ? html`<li class="more-button" @click=${this._toggleExpandedLegend}>
+              <div>
+                ${this.hass.localize(
+                  this._expandedLegend
+                    ? "ui.components.history_charts.collapse_legend"
+                    : "ui.components.history_charts.expand_legend"
+                )}
+                (${items.length})
+              </div>
+              <div>
+                <ha-svg-icon
+                  .path=${this._expandedLegend ? mdiChevronUp : mdiChevronDown}
+                ></ha-svg-icon>
+              </div>
+              <ha-ripple></ha-ripple>
+            </li>`
+          : nothing}
+      </ul>
+    </div>`;
   }
 
   private _formatTimeLabel = (value: number | Date) =>
@@ -195,16 +271,6 @@ export class HaChartBase extends LitElement {
       echarts.registerTheme("custom", this._createTheme());
 
       this.chart = echarts.init(container, "custom");
-      this.chart.on("legendselectchanged", (params: any) => {
-        if (this.externalHidden) {
-          const isSelected = params.selected[params.name];
-          if (isSelected) {
-            fireEvent(this, "dataset-unhidden", { name: params.name });
-          } else {
-            fireEvent(this, "dataset-hidden", { name: params.name });
-          }
-        }
-      });
       this.chart.on("datazoom", (e: any) => {
         const { start, end } = e.batch?.[0] ?? e;
         this._isZoomed = start !== 0 || end !== 100;
@@ -219,7 +285,10 @@ export class HaChartBase extends LitElement {
           this.chart?.getZr()?.setCursorStyle("default");
         }
       });
-      this.chart.setOption({ ...this._createOptions(), series: this.data });
+      this.chart.setOption({
+        ...this._createOptions(),
+        series: this._getSeries(),
+      });
     } finally {
       this._loading = false;
     }
@@ -299,6 +368,9 @@ export class HaChartBase extends LitElement {
       },
       dataZoom: this._getDataZoomConfig(),
       ...this.options,
+      legend: {
+        show: false,
+      },
       xAxis,
     };
 
@@ -507,6 +579,15 @@ export class HaChartBase extends LitElement {
     };
   }
 
+  private _getSeries() {
+    if (!Array.isArray(this.data)) {
+      return this.data;
+    }
+    return this.data.filter(
+      (d) => !this._hiddenDatasets.has(String(d.name ?? d.id))
+    );
+  }
+
   private _getDefaultHeight() {
     return Math.max(this.clientWidth / 2, 200);
   }
@@ -540,19 +621,52 @@ export class HaChartBase extends LitElement {
     this.chart?.dispatchAction({ type: "dataZoom", start: 0, end: 100 });
   }
 
+  private _legendClick(ev: any) {
+    if (!this.chart) {
+      return;
+    }
+    const name = ev.currentTarget?.name;
+    if (this._hiddenDatasets.has(name)) {
+      this._hiddenDatasets.delete(name);
+      fireEvent(this, "dataset-unhidden", { name });
+    } else {
+      this._hiddenDatasets.add(name);
+      fireEvent(this, "dataset-hidden", { name });
+    }
+    this.requestUpdate("_hiddenDatasets");
+  }
+
+  private _toggleExpandedLegend() {
+    this._expandedLegend = !this._expandedLegend;
+    setTimeout(() => {
+      this.chart?.resize();
+    });
+  }
+
   static styles = css`
     :host {
       display: block;
       position: relative;
       letter-spacing: normal;
     }
-    .chart-container {
+    .container {
+      display: flex;
+      flex-direction: column;
       position: relative;
+    }
+    .container.has-height {
       max-height: var(--chart-max-height, 350px);
     }
-    .chart {
+    .chart-container {
       width: 100%;
+      max-height: var(--chart-max-height, 350px);
+    }
+    .has-height .chart-container {
+      flex: 1;
+    }
+    .chart {
       height: 100%;
+      width: 100%;
     }
     .zoom-reset {
       position: absolute;
@@ -564,8 +678,76 @@ export class HaChartBase extends LitElement {
       color: var(--primary-color);
       border: 1px solid var(--divider-color);
     }
-    .has-legend .zoom-reset {
-      top: 64px;
+    .chart-legend {
+      max-height: 60%;
+      overflow-y: auto;
+      margin: 12px 0 0;
+      font-size: 12px;
+      color: var(--primary-text-color);
+    }
+    .chart-legend ul {
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      align-items: center;
+      gap: 8px;
+    }
+    .chart-legend li {
+      height: 24px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 2px;
+      box-sizing: border-box;
+      max-width: 220px;
+      text-overflow: ellipsis;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+    .chart-legend .hidden {
+      color: var(--secondary-text-color);
+    }
+    .chart-legend .label {
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .chart-legend .bullet {
+      border-width: 1px;
+      border-style: solid;
+      border-radius: 50%;
+      display: block;
+      height: 16px;
+      width: 16px;
+      margin-right: 4px;
+      flex-shrink: 0;
+      box-sizing: border-box;
+      margin-inline-end: 4px;
+      margin-inline-start: initial;
+      direction: var(--direction);
+    }
+    .chart-legend .hidden .bullet {
+      border-color: var(--secondary-text-color) !important;
+      background-color: transparent !important;
+    }
+    .chart-legend .more-button {
+      position: relative;
+      border-radius: 8px;
+      padding: 0 4px 0 8px;
+      font-weight: bold;
+      --mdc-icon-size: 20px;
+    }
+    .chart-legend .more-button::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      width: 100%;
+      background-color: var(--light-grey-color);
+      opacity: 0.2;
     }
   `;
 }
